@@ -19,7 +19,7 @@
     "demo:testnet": "pnpm --filter @concord/api demo:testnet"
   },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^7.0.2"
   },
   "pnpm": {
     "onlyBuiltDependencies": ["esbuild"]
