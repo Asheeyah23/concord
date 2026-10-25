@@ -49,7 +49,9 @@ export function parseInstructionsCsv(
       };
       if (type === "clawback") {
         if (!values.units) throw new Error("clawback needs units");
-        instruction.units = parseUnits(values.units, decimals);
+        const units = parseUnits(values.units, decimals);
+        if (units <= 0n) throw new Error("clawback units must be greater than zero");
+        instruction.units = units;
       }
       if (values.approved_by) instruction.approvedBy = values.approved_by;
       if (values.reason) instruction.reason = values.reason;
@@ -99,21 +101,37 @@ export interface ControlsOptions {
   windowMs?: number;
   /** ISO-8601 time the chain is indexed up to. Instructions past their window before it are breaks. */
   asOf: string;
+  /** Accounts known to be frozen at baseline / start. */
+  initialFrozen?: Iterable<string> | Map<string, { authorized?: boolean }>;
 }
 
 /**
  * Classify control events. The first set_authorized(true) for a holder is an authorisation;
- * one that follows a freeze is an unfreeze.
+ * one that follows a freeze is an unfreeze. Accounts present in `initialFrozen` start in the
+ * frozen state.
  */
-export function controlEvents(events: AssetEvent[]): ControlRecord[] {
-  const frozen = new Set<string>();
+export function controlEvents(
+  events: AssetEvent[],
+  initialFrozen?: Iterable<string> | Map<string, { authorized?: boolean }>,
+): ControlRecord[] {
+  let frozen: Set<string>;
+  if (!initialFrozen) {
+    frozen = new Set<string>();
+  } else if (initialFrozen instanceof Map) {
+    frozen = new Set<string>();
+    for (const [address, o] of initialFrozen) {
+      if (o.authorized === false) frozen.add(address);
+    }
+  } else {
+    frozen = new Set<string>(initialFrozen);
+  }
   const out: ControlRecord[] = [];
   for (const ev of sortEvents(events)) {
     if (!ev.from) continue;
     const base = { eventId: ev.id, account: ev.from, ledger: ev.ledger, closedAt: ev.closedAt, txHash: ev.txHash };
     if (ev.kind === "clawback") {
       out.push({ ...base, type: "clawback", units: ev.amount });
-    } else if (ev.kind === "set_authorized") {
+    } else if (ev.kind === "set_authorized" && ev.authorized !== undefined) {
       if (ev.authorized) {
         out.push({ ...base, type: frozen.has(ev.from) ? "unfreeze" : "authorize" });
         frozen.delete(ev.from);
@@ -142,7 +160,7 @@ export function buildControlsLog(
   options: ControlsOptions,
 ): ControlsLog {
   const windowMs = options.windowMs ?? 72 * 3_600_000;
-  const records = controlEvents(events);
+  const records = controlEvents(events, options.initialFrozen);
   const ordered = [...instructions].sort((a, b) => Date.parse(a.issuedAt) - Date.parse(b.issuedAt));
   const used = new Set<string>();
   const breaks: ControlBreak[] = [];

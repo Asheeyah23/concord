@@ -81,6 +81,10 @@ async function main(): Promise<void> {
     case "orgs":
       table(auth.listOrgs().map((o) => ({ id: o.id, name: o.name, members: o.members, created: o.created_at })));
       break;
+    case "purge-expired":
+      if (values.json) out(auth.purgeExpired());
+      else table([auth.purgeExpired()]);
+      break;
     case "signup-code":
       console.log(auth.createSignupCode(values.note));
       break;
@@ -198,6 +202,7 @@ async function main(): Promise<void> {
       if (values.json) return out(action);
       console.log(`${action.label} · record ${action.recordTime} · ${action.state.toUpperCase()}`);
       if (action.result) {
+        for (const w of action.result.warnings) console.log(`  warning: ${w}`);
         console.table(action.result.summary);
         table(action.result.lines.map(({ txHashes: _, ...line }) => line));
       }

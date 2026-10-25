@@ -24,6 +24,7 @@ import {
   type RegisterPosition,
   type Rounding,
 } from "@concord/core";
+import { StrKey } from "@stellar/stellar-sdk";
 import {
   ChainError,
   cursorLedger,
@@ -180,7 +181,28 @@ function addresses(value: unknown, field: string): string[] {
   if (!Array.isArray(value) || value.length > 500 || value.some((v) => typeof v !== "string" || v.length > 80)) {
     throw new Invalid(`${field} must be a list of addresses`);
   }
-  return [...new Set((value as string[]).map((v) => v.trim()).filter(Boolean))];
+  const result: string[] = [];
+  for (const item of value as string[]) {
+    const s = item.trim();
+    if (!s) continue;
+    if (!StrKey.isValidEd25519PublicKey(s) && !StrKey.isValidContract(s) && !StrKey.isValidMed25519PublicKey(s)) {
+      throw new Invalid(`${field} contains an invalid Stellar address: "${item}"`);
+    }
+    result.push(s);
+  }
+  return [...new Set(result)];
+}
+
+function address(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.length > 80) {
+    throw new Invalid(`${field} must be a valid Stellar address`);
+  }
+  const s = value.trim();
+  if (!s || (!StrKey.isValidEd25519PublicKey(s) && !StrKey.isValidContract(s) && !StrKey.isValidMed25519PublicKey(s))) {
+    throw new Invalid(`${field} must be a valid Stellar address`);
+  }
+  return s;
 }
 
 function label(value: unknown, field: string, max = 120): string | undefined {
@@ -347,7 +369,12 @@ export class Concord {
       name ??= found.name;
     }
     // Classic assets carry seven decimals by protocol. A contract token must say, or be told.
-    if (resolved.issuer) decimals = 7;
+    if (resolved.issuer) {
+      if (input.decimals !== undefined && input.decimals !== 7) {
+        throw new Invalid("classic assets always carry 7 decimals");
+      }
+      decimals = 7;
+    }
     if (decimals === undefined) {
       throw new Invalid("this token does not state its decimals; give them when watching it");
     }
@@ -356,7 +383,7 @@ export class Concord {
     const startMode: AssetRecord["startMode"] =
       input.fromLedger !== undefined ? "ledger" : resolved.issuer && input.baseline !== false ? "baseline" : "window";
 
-    this.db.run(
+    this.db.insert(
       `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, start_ledger, ignore_addresses, created_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?, ?, ?)`,
       resolved.id,
@@ -380,7 +407,7 @@ export class Concord {
     try {
       return await this.prepare(this.asset(resolved.id));
     } catch (err) {
-      this.db.run("DELETE FROM assets WHERE id = ?", resolved.id);
+      this.db.write("DELETE FROM assets WHERE id = ?", resolved.id);
       throw err;
     }
   }
@@ -392,9 +419,9 @@ export class Concord {
       if (!asset.issuer) throw new Invalid("opening balances are only available for classic assets");
       const baseline = await chain.baseline(asset.code, asset.issuer, asset.decimals);
       this.db.tx(() => {
-        this.db.run("DELETE FROM openings WHERE asset_id = ?", asset.id);
+        this.db.write("DELETE FROM openings WHERE asset_id = ?", asset.id);
         for (const [address, o] of baseline.openings) {
-          this.db.run(
+          this.db.insert(
             "INSERT INTO openings (asset_id, address, amount, authorized, as_of_ledger) VALUES (?, ?, ?, ?, ?)",
             asset.id,
             address,
@@ -403,7 +430,7 @@ export class Concord {
             o.asOfLedger,
           );
         }
-        this.db.run(
+        this.db.write(
           "UPDATE assets SET state = 'ready', baseline_ledger = ?, start_ledger = ?, history_from = NULL WHERE id = ?",
           baseline.ledger,
           baseline.ledger + 1,
@@ -418,10 +445,10 @@ export class Concord {
             `ledger ${asset.startLedger} is older than the RPC retains (oldest ${oldest}); use a baseline`,
           );
         }
-        this.db.run("UPDATE assets SET state = 'ready' WHERE id = ?", asset.id);
+        this.db.write("UPDATE assets SET state = 'ready' WHERE id = ?", asset.id);
       } else {
         // The retention window slides while we work, so do not start on its very edge.
-        this.db.run(
+        this.db.write(
           "UPDATE assets SET state = 'ready', start_ledger = ?, history_from = ? WHERE id = ?",
           Math.min(oldest + 20, latest),
           oldestClosedAt ?? null,
@@ -436,7 +463,7 @@ export class Concord {
   updateAsset(ref: string, patch: { name?: string; ignore?: string[] }): AssetRecord {
     const asset = this.asset(ref);
     const name = label(patch.name, "name");
-    this.db.run(
+    this.db.write(
       "UPDATE assets SET name = ?, ignore_addresses = ? WHERE id = ?",
       name ?? asset.name,
       JSON.stringify(patch.ignore === undefined ? asset.ignore : addresses(patch.ignore, "ignore")),
@@ -450,7 +477,7 @@ export class Concord {
     const asset = this.asset(ref);
     // A pass still running would write its events into an asset watched again under the same id.
     await this.syncing.get(asset.id)?.catch(() => {});
-    this.db.run("DELETE FROM assets WHERE id = ?", asset.id);
+    this.db.write("DELETE FROM assets WHERE id = ?", asset.id);
     this.touch(asset.id);
   }
 
@@ -463,9 +490,9 @@ export class Concord {
     const asset = this.asset(ref);
     await this.syncing.get(asset.id)?.catch(() => {});
     this.db.tx(() => {
-      this.db.run("DELETE FROM events WHERE asset_id = ?", asset.id);
-      this.db.run("DELETE FROM openings WHERE asset_id = ?", asset.id);
-      this.db.run(
+      this.db.write("DELETE FROM events WHERE asset_id = ?", asset.id);
+      this.db.write("DELETE FROM openings WHERE asset_id = ?", asset.id);
+      this.db.write(
         `UPDATE assets SET state = 'indexing', start_mode = ?, start_ledger = NULL, baseline_ledger = NULL,
            history_from = NULL, cursor = NULL, synced_ledger = NULL, synced_at = NULL, sync_error = NULL, sync_error_at = NULL
          WHERE id = ?`,
@@ -533,11 +560,11 @@ export class Concord {
       }
       const out = await this.syncPass(ready, chain);
       if (asset.syncError) {
-        this.db.run("UPDATE assets SET sync_error = NULL, sync_error_at = NULL WHERE id = ?", asset.id);
+        this.db.write("UPDATE assets SET sync_error = NULL, sync_error_at = NULL WHERE id = ?", asset.id);
       }
       return out;
     } catch (err) {
-      this.db.run("UPDATE assets SET sync_error = ?, sync_error_at = ? WHERE id = ?", describeFailure(err), now(), asset.id);
+      this.db.write("UPDATE assets SET sync_error = ?, sync_error_at = ? WHERE id = ?", describeFailure(err), now(), asset.id);
       throw err;
     }
   }
@@ -560,7 +587,7 @@ export class Concord {
       this.db.tx(() => {
         for (const ev of page.events) wrote += this.insertEvent(asset.id, ev) ? 1 : 0;
         if (atTip) {
-          this.db.run(
+          this.db.write(
             `UPDATE assets SET cursor = COALESCE(?, cursor), synced_ledger = MAX(COALESCE(synced_ledger, 0), ?),
                synced_at = COALESCE(?, synced_at) WHERE id = ?`,
             cursor ?? null,
@@ -571,7 +598,7 @@ export class Concord {
         } else {
           // Only a pass that reaches the tip may say how far the asset is indexed. Moving the
           // watermark on every page would have a pass that dies half-way claim the whole chain.
-          this.db.run("UPDATE assets SET cursor = ? WHERE id = ?", cursor, asset.id);
+          this.db.write("UPDATE assets SET cursor = ? WHERE id = ?", cursor, asset.id);
         }
       });
       if (wrote > 0) {
@@ -666,12 +693,20 @@ export class Concord {
         status: state.authorized.has(address) ? (state.authorized.get(address) ? "active" : "frozen") : null,
         ignored: ignored.has(address),
       }));
+    const start = this.historyStart(asset);
+    const beforeHistory = Boolean(upTo && start && upTo < start);
+    const warnings: string[] = [];
+    if (beforeHistory) {
+      warnings.push(`as-of time (${upTo}) is earlier than history start (${start}); activity before history start is not reflected`);
+    }
     return {
       asOf: upTo ?? asset.syncedAt ?? null,
       ledger: state.ledger,
       supply: formatUnits(state.supply, asset.decimals),
       holderCount: holders.length,
       incomplete: state.incomplete,
+      beforeHistory,
+      warnings,
       holders,
     };
   }
@@ -726,7 +761,7 @@ export class Concord {
     }
     if (parsed.positions.length === 0) throw new Invalid("register has no usable rows");
     const registerId = this.db.tx(() => {
-      const id = this.db.run(
+      const id = this.db.insert(
         "INSERT INTO registers (asset_id, as_of, source, sha256, issues, imported_by, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         asset.id,
         asOf,
@@ -737,7 +772,7 @@ export class Concord {
         now(),
       );
       for (const p of parsed.positions) {
-        this.db.run(
+        this.db.insert(
           "INSERT INTO register_positions (register_id, holder_id, holder_name, account, units, status) VALUES (?, ?, ?, ?, ?, ?)",
           id,
           p.holderId,
@@ -799,7 +834,7 @@ export class Concord {
     }
     this.db.tx(() => {
       for (const e of parsed.entries) {
-        this.db.run(
+        this.db.insert(
           `INSERT OR REPLACE INTO journal (asset_id, ref, date, type, from_addr, to_addr, units, tx_hash)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           asset.id,
@@ -841,7 +876,7 @@ export class Concord {
     }
     this.db.tx(() => {
       for (const i of parsed.instructions) {
-        this.db.run(
+        this.db.insert(
           `INSERT OR REPLACE INTO instructions (asset_id, ref, type, account, units, issued_at, approved_by, reason)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           asset.id,
@@ -891,6 +926,12 @@ export class Concord {
     if (chainBehind) {
       warnings.push(
         `Chain is indexed to ${asset.syncedAt ?? "nothing"}, before the register's as-of time; later activity is not reflected`,
+      );
+    }
+    const start = this.historyStart(asset);
+    if (start && asOf < start) {
+      warnings.push(
+        `Register as-of time (${asOf}) is earlier than history start (${start}); activity before history start is not reflected`,
       );
     }
     const events = this.loadEvents(asset.id);
@@ -994,7 +1035,7 @@ export class Concord {
       movement,
       breaks,
     };
-    const id = this.db.run(
+    const id = this.db.insert(
       "INSERT INTO runs (asset_id, register_id, as_of, created_by, created_at, result) VALUES (?, ?, ?, ?, ?, ?)",
       asset.id,
       Number(reg.id),
@@ -1085,7 +1126,7 @@ export class Concord {
       const owned = action && this.db.get("SELECT id FROM actions WHERE id = ? AND asset_id = ?", Number(action[1]), asset.id);
       if (!owned) throw new Invalid("scope must be recon, controls or an action of this asset");
     }
-    this.db.run(
+    this.db.insert(
       `INSERT OR REPLACE INTO break_notes (asset_id, scope, key, fingerprint, status, note, author, author_id, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       asset.id,
@@ -1116,7 +1157,7 @@ export class Concord {
       const pay = input.payAsset ? this.asset(String(input.payAsset)) : asset;
       if (pay.network !== asset.network) throw new Invalid("the pay asset must be on the same network");
       params.payAsset = pay.id;
-      const payer = label(input.payer, "payer", 80);
+      const payer = address(input.payer, "payer");
       if (payer) params.payer = payer;
       if (input.rounding !== undefined && input.rounding !== "floor" && input.rounding !== "half-up") {
         throw new Invalid("rounding must be floor or half-up");
@@ -1142,7 +1183,7 @@ export class Concord {
         : input.type === "split"
           ? `Split ${input.num}:${input.den}`
           : `Redemption ${input.num}/${input.den}`);
-    const id = this.db.run(
+    const id = this.db.insert(
       "INSERT INTO actions (asset_id, type, label, record_time, params, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       asset.id,
       input.type,
@@ -1155,6 +1196,16 @@ export class Concord {
     return this.reconcileAction(id);
   }
 
+  /** Establish where the asset's indexed history begins. */
+  private historyStart(asset: AssetRecord): string | undefined {
+    if (asset.historyFrom) return asset.historyFrom;
+    const first = this.db.get<{ closed_at: string }>(
+      "SELECT closed_at FROM events WHERE asset_id = ? ORDER BY ledger ASC, id ASC LIMIT 1",
+      asset.id,
+    );
+    return first?.closed_at;
+  }
+
   /** Freeze the record-date holdings once the indexed chain has passed the record time. */
   private snapshot(asset: AssetRecord, row: Row): HoldingsState | undefined {
     if (row.snapshot) {
@@ -1165,11 +1216,13 @@ export class Concord {
       return { balances, authorized: new Map(), supply, ledger: stored.ledger, eventCount: 0, incomplete: [] };
     }
     const recordTime = String(row.record_time);
+    const start = this.historyStart(asset);
+    if (start && recordTime < start) return undefined;
     if (!asset.syncedAt || asset.syncedAt < recordTime) return undefined;
     const state = this.state(asset, recordTime);
     const holders: Record<string, string> = {};
     for (const [address, units] of state.balances) holders[address] = units.toString();
-    this.db.run(
+    this.db.write(
       "UPDATE actions SET snapshot = ? WHERE id = ?",
       JSON.stringify({ ledger: state.ledger, takenAt: now(), holders }),
       Number(row.id),
@@ -1188,6 +1241,23 @@ export class Concord {
     const asset = this.asset(String(row.asset_id));
     const flowAsset = type === "dividend" ? this.asset(String(params.payAsset)) : asset;
     if (refresh && flowAsset.id !== asset.id) await this.trySync(flowAsset, warnings);
+
+    const recordTime = String(row.record_time);
+    const start = this.historyStart(asset);
+    if (start && recordTime < start) {
+      warnings.push(`Record time (${recordTime}) is earlier than history start (${start}); cannot snapshot holdings before the asset was indexed.`);
+      const result: ActionResult = {
+        reconciledThrough: flowAsset.syncedAt ?? null,
+        warnings,
+        status: "clean",
+        flowAsset: { id: flowAsset.id, code: flowAsset.code },
+        summary: { holders: 0, expectedTotal: "0", observedTotal: "0", difference: "0", breakCount: 0 },
+        lines: [],
+        breaks: [],
+      };
+      this.db.write("UPDATE actions SET result = ?, reconciled_at = ? WHERE id = ?", JSON.stringify(result), now(), id);
+      return this.action(id);
+    }
 
     const snapshot = this.snapshot(asset, row);
     if (!snapshot) return this.action(id);
@@ -1212,14 +1282,14 @@ export class Concord {
       if (type === "split") {
         expected = splitDeltas(snapshot, ratio, exclude);
         plus = ["mint"];
-        minus = ["clawback"];
+        // Reverse splits can retire units via burn as well as issuer clawback.
+        minus = ["burn", "clawback"];
       } else {
         expected = redemptionDeltas(snapshot, ratio, exclude);
         plus = [];
         minus = ["burn", "clawback"];
       }
     }
-    const recordTime = String(row.record_time);
     const windowTo = params.windowTo as string | undefined;
     const observed = observeFlows(this.loadEvents(flowAsset.id), {
       afterTime: recordTime,
@@ -1228,6 +1298,9 @@ export class Concord {
       ...(windowTo ? { untilTime: windowTo } : {}),
       ...(payer ? { payer } : {}),
     });
+    if (payer && observed.size === 0) {
+      warnings.push(`Payer ${payer} has no recorded flows in the action window`);
+    }
     const ignore = [...exclude, ...(payer ? [payer] : [])];
     const recon = reconcileDistribution(snapshot, expected, observed, { ignore });
     const base = (v: bigint) => formatUnits(v, asset.decimals);
@@ -1268,7 +1341,7 @@ export class Concord {
         }),
       ),
     };
-    this.db.run("UPDATE actions SET result = ?, reconciled_at = ? WHERE id = ?", JSON.stringify(result), now(), id);
+    this.db.write("UPDATE actions SET result = ?, reconciled_at = ? WHERE id = ?", JSON.stringify(result), now(), id);
     return this.action(id);
   }
 
@@ -1337,8 +1410,13 @@ export class Concord {
 
   controls(ref: string) {
     const asset = this.asset(ref);
+    const initialFrozen = new Set<string>();
+    for (const [address, opening] of this.openings(asset.id)) {
+      if (opening.authorized === false) initialFrozen.add(address);
+    }
     const log = buildControlsLog(this.loadControlEvents(asset.id), this.instructions(asset.id), {
       asOf: asset.syncedAt ?? new Date().toISOString(),
+      initialFrozen,
     });
     const instructionJson = (i: Instruction) => ({
       ref: i.ref,
@@ -1444,7 +1522,10 @@ export class Concord {
         ignoredAddresses: asset.ignore,
       },
       period: { from, to },
-      holdings: this.holdings(asset.id, to),
+      holdings: (() => {
+        const { beforeHistory: _beforeHistory, warnings: _warnings, ...rest } = this.holdings(asset.id, to);
+        return rest;
+      })(),
       reconciliations: runs,
       corporateActions: this.actions(asset.id).filter((a) => inPeriod(a.recordTime)),
       controls: {
